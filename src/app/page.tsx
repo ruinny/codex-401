@@ -16,7 +16,7 @@ import { useDebouncedValue } from '@/lib/useDebouncedValue';
 import { cn } from '@/lib/utils';
 
 type ResultState = 'unknown' | 'normal' | 'failed';
-type ResultFilter = 'all' | 'normal' | 'failed';
+type ResultFilter = 'all' | 'normal' | 'failed' | 'unknown';
 
 interface ProbeTarget {
   auth_index?: string;
@@ -218,6 +218,10 @@ export default function Home() {
         return false;
       }
 
+      if (resultFilter === 'unknown' && acc.result !== 'unknown') {
+        return false;
+      }
+
       if (!normalizedSearch) return true;
 
       const name = (acc.name || '').toLowerCase();
@@ -249,6 +253,7 @@ export default function Home() {
 
   const failedCount = useMemo(() => accounts.filter(a => a.result === 'failed').length, [accounts]);
   const normalCount = useMemo(() => accounts.filter(a => a.result === 'normal').length, [accounts]);
+  const unknownCount = useMemo(() => accounts.filter(a => a.result === 'unknown').length, [accounts]);
   const isDeletingAny = useMemo(() => accounts.some(acc => acc.isDeleting), [accounts]);
 
   const progressPercentage = progress.total > 0 ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : 0;
@@ -434,9 +439,9 @@ export default function Home() {
   ): { result: ResultState; status_code: number | null; invalid_401: boolean } => {
     if (statuses.length === 0) {
       return {
-        result: 'failed',
+        result: 'unknown',
         status_code: null,
-        invalid_401: true,
+        invalid_401: false,
       };
     }
 
@@ -460,11 +465,10 @@ export default function Home() {
       };
     }
 
-    const lastStatus = statuses[statuses.length - 1];
     return {
-      result: lastStatus === 401 ? 'failed' : 'normal',
-      status_code: lastStatus,
-      invalid_401: lastStatus === 401,
+      result: 'unknown',
+      status_code: statuses[statuses.length - 1] ?? null,
+      invalid_401: false,
     };
   };
 
@@ -608,7 +612,7 @@ export default function Home() {
             status_code: finalResult.status_code,
             invalid_401: finalResult.invalid_401,
             result: finalResult.result,
-            error: finalResult.result === 'failed' ? (probeError || null) : null,
+            error: finalResult.result === 'unknown' ? (probeError || '复检结果不足，暂不判定失败') : null,
           });
         } catch (err: unknown) {
           if (scanAbortController.current?.signal.aborted) {
@@ -617,8 +621,8 @@ export default function Home() {
 
           const message = err instanceof Error ? err.message : '探测失败';
           queueScanAccountUpdate(index, {
-            result: 'failed',
-            invalid_401: true,
+            result: 'unknown',
+            invalid_401: false,
             error: message,
           });
         } finally {
@@ -736,10 +740,10 @@ export default function Home() {
         <section className="bg-white/75 border border-white/60 rounded-2xl shadow-sm p-4 text-xs md:text-sm text-gray-700 space-y-2">
           <p className="font-semibold text-gray-800">功能与逻辑说明</p>
           <p>
-            功能：批量检测账号状态，按“全部 / 正常 / 失败”筛选，并支持批量删除失败账号。
+            功能：批量检测账号状态，按“全部 / 正常 / 失败 / 未知”筛选，并支持批量删除失败账号。
           </p>
           <p>
-            逻辑：每个账号默认进行 3 轮探测，若 401 次数 ≥ 2 判定为失败，否则判定为正常；检测过程支持停止。
+            逻辑：每个账号默认进行 3 轮探测，若 401 次数 ≥ 2 判定为失败；非 401 次数 ≥ 2 判定为正常；超时或证据不足归为未知，不进入删除。
           </p>
         </section>
 
@@ -808,6 +812,7 @@ export default function Home() {
           <div className="flex flex-wrap gap-3 text-xs text-gray-600">
             <span>失败：{failedCount}</span>
             <span>正常：{normalCount}</span>
+            <span>未知：{unknownCount}</span>
           </div>
         </section>
 
@@ -847,6 +852,7 @@ export default function Home() {
               <option value="all">全部</option>
               <option value="normal">正常</option>
               <option value="failed">失败</option>
+              <option value="unknown">未知</option>
             </select>
           </label>
         </div>
@@ -909,7 +915,8 @@ export default function Home() {
                         key={rowKey}
                         className={cn(
                           'transition-colors hover:bg-macaron-cream/70',
-                          acc.result === 'failed' && 'bg-red-50/80'
+                          acc.result === 'failed' && 'bg-red-50/80',
+                          acc.result === 'unknown' && 'bg-amber-50/80'
                         )}
                       >
                         <td className="px-4 py-3 font-medium text-gray-800">{acc.name}</td>
@@ -932,7 +939,7 @@ export default function Home() {
                           {acc.result === 'failed' ? (
                             <div className="text-rose-600">
                               <span className="flex items-center gap-1">
-                                <AlertCircle className="w-4 h-4" /> 失败
+                                <AlertCircle className="w-4 h-4" /> 失败（确认 401）
                               </span>
                               {acc.error && <span className="text-xs text-rose-500">{acc.error}</span>}
                             </div>
@@ -940,10 +947,13 @@ export default function Home() {
                             <span className="flex items-center gap-1 text-emerald-600">
                               <CheckCircle2 className="w-4 h-4" /> 正常
                             </span>
-                          ) : acc.error ? (
-                            <span className="text-rose-500 line-clamp-2" title={acc.error}>{acc.error}</span>
                           ) : (
-                            <span className="text-zinc-400">等待检测...</span>
+                            <div className="text-amber-600">
+                              <span className="flex items-center gap-1">
+                                <AlertCircle className="w-4 h-4" /> 未知（超时/证据不足）
+                              </span>
+                              {acc.error && <span className="text-xs text-amber-500">{acc.error}</span>}
+                            </div>
                           )}
                         </td>
                         <td className="px-4 py-3 text-right">
