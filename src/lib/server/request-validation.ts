@@ -74,7 +74,10 @@ export const parseBaseUrl = (value: unknown): string => {
     throw new ApiRequestError('baseUrl 不在允许的主机列表中', 403, 'BASE_URL_NOT_ALLOWED');
   }
 
-  return parsed.origin;
+  const normalizedPath = parsed.pathname.replace(/\/+$/, '');
+  const basePath = normalizedPath === '/' ? '' : normalizedPath;
+
+  return `${parsed.origin}${basePath}`;
 };
 
 export const parseTimeoutSeconds = (

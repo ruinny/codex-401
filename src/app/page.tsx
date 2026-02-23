@@ -8,23 +8,34 @@ import {
   AlertCircle,
   Loader2,
   Search,
-  Pause
+  Pause,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { useDebouncedValue } from '@/lib/useDebouncedValue';
 import { cn } from '@/lib/utils';
 
-interface Account {
+type ResultState = 'unknown' | 'normal' | 'failed';
+type ResultFilter = 'all' | 'normal' | 'failed';
+
+interface ProbeTarget {
+  auth_index?: string;
+  chatgpt_account_id?: string;
+  chatgptAccountId?: string;
+  account_id?: string;
+  accountId?: string;
+}
+
+interface Account extends ProbeTarget {
   name: string;
   account?: string;
   email?: string;
-  auth_index?: string;
   type?: string;
   typo?: string;
   provider?: string;
   status_code?: number | null;
   invalid_401?: boolean;
+  result?: ResultState;
   error?: string | null;
   isDeleting?: boolean;
   deleteStatus?: 'success' | 'failed' | null;
@@ -39,6 +50,9 @@ const DELETE_CONCURRENCY = 5;
 const SEARCH_DEBOUNCE_MS = 250;
 const SCAN_FLUSH_INTERVAL_MS = 80;
 const SCAN_FLUSH_BATCH_SIZE = 20;
+const PROBE_RETRY_LIMIT = 1;
+const SCAN_RECHECK_ROUNDS = 3;
+const SCAN_RECHECK_DELAY_MS = 200;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -70,7 +84,9 @@ const normalizeBaseUrl = (raw: string): string => {
     throw new Error('Base URL 仅支持 http/https');
   }
 
-  return parsed.origin;
+  const normalizedPath = parsed.pathname.replace(/\/+$/, '');
+  const basePath = normalizedPath === '/' ? '' : normalizedPath;
+  return `${parsed.origin}${basePath}`;
 };
 
 const extractApiErrorMessage = (payload: unknown, fallback: string): string => {
@@ -92,6 +108,40 @@ const extractApiErrorMessage = (payload: unknown, fallback: string): string => {
   }
 
   return fallback;
+};
+
+const getOptionalString = (value: unknown): string | undefined => {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  return String(value);
+};
+
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort);
+      if (signal.aborted) {
+        onAbort();
+      }
+    }
+  });
 };
 
 async function limitConcurrency<T>(
@@ -145,6 +195,7 @@ export default function Home() {
   const [scanStopped, setScanStopped] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [search, setSearch] = useState('');
+  const [resultFilter, setResultFilter] = useState<ResultFilter>('all');
   const [page, setPage] = useState(1);
 
   const scanAbortController = useRef<AbortController | null>(null);
@@ -158,15 +209,23 @@ export default function Home() {
   const normalizedSearch = debouncedSearch.trim().toLowerCase();
 
   const filteredAccounts = useMemo(() => {
-    if (!normalizedSearch) return accounts;
-
     return accounts.filter(acc => {
+      if (resultFilter === 'normal' && acc.result !== 'normal') {
+        return false;
+      }
+
+      if (resultFilter === 'failed' && acc.result !== 'failed') {
+        return false;
+      }
+
+      if (!normalizedSearch) return true;
+
       const name = (acc.name || '').toLowerCase();
       const accountValue = (acc.account || '').toLowerCase();
       const email = (acc.email || '').toLowerCase();
       return [name, accountValue, email].some(field => field.includes(normalizedSearch));
     });
-  }, [accounts, normalizedSearch]);
+  }, [accounts, normalizedSearch, resultFilter]);
 
   const totalPages = useMemo(() => {
     return Math.max(1, Math.ceil(filteredAccounts.length / PAGE_SIZE));
@@ -176,6 +235,10 @@ export default function Home() {
     setPage(prev => Math.min(prev, totalPages));
   }, [totalPages]);
 
+  useEffect(() => {
+    setPage(1);
+  }, [normalizedSearch, resultFilter]);
+
   const pagedAccounts = useMemo(() => {
     const start = (page - 1) * PAGE_SIZE;
     return filteredAccounts.slice(start, start + PAGE_SIZE);
@@ -184,7 +247,8 @@ export default function Home() {
   const pageStart = filteredAccounts.length === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
   const pageEnd = Math.min(page * PAGE_SIZE, filteredAccounts.length);
 
-  const invalidCount = useMemo(() => accounts.filter(a => a.invalid_401).length, [accounts]);
+  const failedCount = useMemo(() => accounts.filter(a => a.result === 'failed').length, [accounts]);
+  const normalCount = useMemo(() => accounts.filter(a => a.result === 'normal').length, [accounts]);
   const isDeletingAny = useMemo(() => accounts.some(acc => acc.isDeleting), [accounts]);
 
   const progressPercentage = progress.total > 0 ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : 0;
@@ -286,6 +350,124 @@ export default function Home() {
     });
   };
 
+  const buildProbePayload = (target: ProbeTarget) => {
+    const chatgptAccountSource =
+      target.chatgpt_account_id
+      ?? target.chatgptAccountId
+      ?? target.account_id
+      ?? target.accountId
+      ?? chatgptAccountId;
+
+    const chatgpt_account_id = chatgptAccountSource == null ? '' : String(chatgptAccountSource);
+
+    return {
+      authIndex: target.auth_index,
+      method: 'GET',
+      url: 'https://chatgpt.com/backend-api/wham/usage',
+      header: {
+        Authorization: 'Bearer $TOKEN$',
+        'Content-Type': 'application/json',
+        'User-Agent': userAgent,
+        ...(chatgpt_account_id ? { 'Chatgpt-Account-Id': chatgpt_account_id } : {}),
+      },
+    };
+  };
+
+  const probeAccountStatus = async (
+    params: {
+      normalizedBaseUrl: string;
+      token: string;
+      timeoutSeconds: number;
+      target: ProbeTarget;
+      signal?: AbortSignal;
+    }
+  ): Promise<number | null> => {
+    const { normalizedBaseUrl, token: requestToken, timeoutSeconds, target, signal } = params;
+
+    const payload = buildProbePayload(target);
+
+    let attempts = 0;
+    while (true) {
+      if (signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+
+      try {
+        const probeRes = await fetch('/api/probe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            baseUrl: normalizedBaseUrl,
+            token: requestToken,
+            payload,
+            timeout: timeoutSeconds,
+          }),
+          signal,
+        });
+
+        const probeData: unknown = await probeRes.json().catch(() => ({}));
+        if (!probeRes.ok) {
+          throw new Error(extractApiErrorMessage(probeData, `探测返回 ${probeRes.status}`));
+        }
+
+        const statusCode = isRecord(probeData) && typeof probeData.status_code === 'number'
+          ? probeData.status_code
+          : null;
+
+        return statusCode;
+      } catch (err: unknown) {
+        if (signal?.aborted) {
+          throw err;
+        }
+
+        if (attempts >= PROBE_RETRY_LIMIT) {
+          throw err;
+        }
+
+        attempts += 1;
+      }
+    }
+  };
+
+  const classifyFromStatuses = (
+    statuses: number[]
+  ): { result: ResultState; status_code: number | null; invalid_401: boolean } => {
+    if (statuses.length === 0) {
+      return {
+        result: 'failed',
+        status_code: null,
+        invalid_401: true,
+      };
+    }
+
+    const count401 = statuses.filter(code => code === 401).length;
+    const countNon401 = statuses.length - count401;
+
+    if (count401 >= 2) {
+      return {
+        result: 'failed',
+        status_code: 401,
+        invalid_401: true,
+      };
+    }
+
+    if (countNon401 >= 2) {
+      const latestNon401 = [...statuses].reverse().find(code => code !== 401) ?? statuses[statuses.length - 1];
+      return {
+        result: 'normal',
+        status_code: latestNon401,
+        invalid_401: false,
+      };
+    }
+
+    const lastStatus = statuses[statuses.length - 1];
+    return {
+      result: lastStatus === 401 ? 'failed' : 'normal',
+      status_code: lastStatus,
+      invalid_401: lastStatus === 401,
+    };
+  };
+
   const startCheck = async () => {
     if (isChecking) return;
 
@@ -320,6 +502,7 @@ export default function Home() {
     setIsChecking(true);
     setAccounts([]);
     setPage(1);
+    setResultFilter('all');
     setProgress({ current: 0, total: 0 });
     resetScanBuffers();
 
@@ -343,35 +526,41 @@ export default function Home() {
       const targetTypeValue = targetType.trim().toLowerCase();
       const providerValue = provider.trim().toLowerCase();
 
-      const candidates = allFiles.filter((file): file is Record<string, unknown> => {
-        if (!isRecord(file)) return false;
+      const candidates: Account[] = allFiles
+        .filter((file): file is Record<string, unknown> => {
+          if (!isRecord(file)) return false;
 
-        const type = String(file.type ?? file.typo ?? '').toLowerCase();
-        if (type !== targetTypeValue) return false;
+          const type = String(file.type ?? file.typo ?? '').toLowerCase();
+          if (type !== targetTypeValue) return false;
 
-        if (providerValue) {
-          const fileProvider = String(file.provider ?? '').toLowerCase();
-          if (fileProvider !== providerValue) return false;
-        }
+          if (providerValue) {
+            const fileProvider = String(file.provider ?? '').toLowerCase();
+            if (fileProvider !== providerValue) return false;
+          }
 
-        return true;
-      });
+          return true;
+        })
+        .map(file => ({
+          name: String(file.name ?? ''),
+          account: String(file.account ?? file.email ?? ''),
+          email: getOptionalString(file.email),
+          auth_index: getOptionalString(file.auth_index),
+          type: getOptionalString(file.type),
+          typo: getOptionalString(file.typo),
+          provider: getOptionalString(file.provider),
+          chatgpt_account_id: getOptionalString(file.chatgpt_account_id),
+          chatgptAccountId: getOptionalString(file.chatgptAccountId),
+          account_id: getOptionalString(file.account_id),
+          accountId: getOptionalString(file.accountId),
+          status_code: null,
+          invalid_401: false,
+          result: 'unknown',
+          error: null,
+          isDeleting: false,
+          deleteStatus: null,
+        }));
 
-      setAccounts(candidates.map(file => ({
-        name: String(file.name ?? ''),
-        account: String(file.account ?? file.email ?? ''),
-        email: file.email == null ? undefined : String(file.email),
-        auth_index: file.auth_index == null ? undefined : String(file.auth_index),
-        type: file.type == null ? undefined : String(file.type),
-        typo: file.typo == null ? undefined : String(file.typo),
-        provider: file.provider == null ? undefined : String(file.provider),
-        status_code: null,
-        invalid_401: false,
-        error: null,
-        isDeleting: false,
-        deleteStatus: null,
-      })));
-
+      setAccounts(candidates);
       setProgress({ current: 0, total: candidates.length });
 
       if (candidates.length === 0) {
@@ -383,80 +572,55 @@ export default function Home() {
           const innerController = scanAbortController.current;
           if (!innerController) return;
 
-          const chatgptAccountSource =
-            item.chatgpt_account_id
-            ?? item.chatgptAccountId
-            ?? item.account_id
-            ?? item.accountId
-            ?? chatgptAccountId;
+          const statuses: number[] = [];
+          let probeError: string | null = null;
 
-          const chatgpt_account_id = chatgptAccountSource == null ? '' : String(chatgptAccountSource);
-
-          const payload = {
-            authIndex: item.auth_index,
-            method: 'GET',
-            url: 'https://chatgpt.com/backend-api/wham/usage',
-            header: {
-              Authorization: 'Bearer $TOKEN$',
-              'Content-Type': 'application/json',
-              'User-Agent': userAgent,
-              ...(chatgpt_account_id ? { 'Chatgpt-Account-Id': chatgpt_account_id } : {}),
-            },
-          };
-
-          let attempts = 0;
-          while (true) {
+          for (let round = 0; round < SCAN_RECHECK_ROUNDS; round += 1) {
             if (innerController.signal.aborted) {
               return;
             }
 
             try {
-              const probeRes = await fetch('/api/probe', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  baseUrl: normalizedBaseUrl,
-                  token,
-                  payload,
-                  timeout: safeTimeout,
-                }),
+              const status = await probeAccountStatus({
+                normalizedBaseUrl,
+                token,
+                timeoutSeconds: safeTimeout,
+                target: item,
                 signal: innerController.signal,
               });
 
-              const probeData: unknown = await probeRes.json().catch(() => ({}));
-              if (!probeRes.ok) {
-                throw new Error(extractApiErrorMessage(probeData, `探测返回 ${probeRes.status}`));
+              if (typeof status === 'number') {
+                statuses.push(status);
+              } else {
+                probeError = '探测缺少 status_code';
               }
-
-              const statusCode = isRecord(probeData) && typeof probeData.status_code === 'number'
-                ? probeData.status_code
-                : null;
-
-              queueScanAccountUpdate(index, {
-                status_code: statusCode,
-                invalid_401: statusCode === 401,
-                error: statusCode === null ? 'Missing status_code' : null,
-              });
-              break;
             } catch (err: unknown) {
-              if (innerController.signal.aborted) {
-                return;
-              }
+              probeError = err instanceof Error ? err.message : '探测失败';
+            }
 
-              if (attempts >= 1) {
-                throw err;
-              }
-
-              attempts += 1;
+            if (round < SCAN_RECHECK_ROUNDS - 1) {
+              await sleep(SCAN_RECHECK_DELAY_MS, innerController.signal);
             }
           }
+
+          const finalResult = classifyFromStatuses(statuses);
+          queueScanAccountUpdate(index, {
+            status_code: finalResult.status_code,
+            invalid_401: finalResult.invalid_401,
+            result: finalResult.result,
+            error: finalResult.result === 'failed' ? (probeError || null) : null,
+          });
         } catch (err: unknown) {
           if (scanAbortController.current?.signal.aborted) {
             return;
           }
 
           const message = err instanceof Error ? err.message : '探测失败';
-          queueScanAccountUpdate(index, { error: message });
+          queueScanAccountUpdate(index, {
+            result: 'failed',
+            invalid_401: true,
+            error: message,
+          });
         } finally {
           queueProgressTick();
         }
@@ -489,10 +653,10 @@ export default function Home() {
   };
 
   const deleteInvalid = async () => {
-    const invalidAccounts = accounts.filter(a => a.invalid_401);
-    if (invalidAccounts.length === 0) return;
+    const failedAccounts = accounts.filter(a => a.result === 'failed');
+    if (failedAccounts.length === 0) return;
 
-    if (!confirm(`确定要删除这 ${invalidAccounts.length} 个失效账号吗？`)) return;
+    if (!confirm(`确定要删除这 ${failedAccounts.length} 个失败账号吗？`)) return;
 
     let normalizedBaseUrl = '';
     try {
@@ -509,7 +673,7 @@ export default function Home() {
     }
 
     await limitConcurrency(accounts, DELETE_CONCURRENCY, async (acc, index) => {
-      if (!acc.invalid_401) return;
+      if (acc.result !== 'failed') return;
 
       updateAccountImmediate(index, { isDeleting: true });
 
@@ -529,7 +693,7 @@ export default function Home() {
           isDeleting: false,
           deleteStatus: res.ok ? 'success' : 'failed',
         });
-      } catch (error) {
+      } catch {
         updateAccountImmediate(index, {
           isDeleting: false,
           deleteStatus: 'failed',
@@ -560,11 +724,11 @@ export default function Home() {
             <Button
               variant="secondary"
               onClick={deleteInvalid}
-              disabled={invalidCount === 0 || isDeletingAny}
+              disabled={failedCount === 0 || isDeletingAny || isChecking}
               className="gap-2"
             >
               <Trash2 className="w-4 h-4" />
-              <span>删除失效 ({invalidCount})</span>
+              <span>删除失败账号 ({failedCount})</span>
             </Button>
           </div>
         </div>
@@ -631,12 +795,16 @@ export default function Home() {
               />
             </label>
           </div>
+          <div className="flex flex-wrap gap-3 text-xs text-gray-600">
+            <span>失败：{failedCount}</span>
+            <span>正常：{normalCount}</span>
+          </div>
         </section>
 
         {progress.total > 0 && (
           <section className="bg-white/70 border border-white/60 rounded-2xl p-5 shadow-sm">
             <div className="flex items-center justify-between text-sm text-gray-700">
-              <span>进度：{progressLabel}</span>
+              <span>扫描进度：{progressLabel}</span>
               <span>{progressPercentage}%</span>
             </div>
             <div className="mt-3 h-2 rounded-full bg-white/40">
@@ -648,14 +816,29 @@ export default function Home() {
           </section>
         )}
 
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
-          <input
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            placeholder="搜索账号名或邮箱..."
-            className="w-full rounded-2xl border border-zinc-200 bg-white/70 px-4 py-2 pl-10 text-sm text-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-macaron-mint"
-          />
+        <div className="grid gap-3 md:grid-cols-[1fr_auto] md:items-center">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="搜索账号名或邮箱..."
+              className="w-full rounded-2xl border border-zinc-200 bg-white/70 px-4 py-2 pl-10 text-sm text-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-macaron-mint"
+            />
+          </div>
+
+          <label className="text-sm font-medium text-gray-600 flex items-center gap-2 md:justify-end">
+            按结果筛选
+            <select
+              value={resultFilter}
+              onChange={e => setResultFilter(e.target.value as ResultFilter)}
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-macaron-mint"
+            >
+              <option value="all">全部</option>
+              <option value="normal">正常</option>
+              <option value="failed">失败</option>
+            </select>
+          </label>
         </div>
 
         <section className="bg-white/90 border border-white/60 rounded-2xl shadow-macaron overflow-hidden">
@@ -716,7 +899,7 @@ export default function Home() {
                         key={rowKey}
                         className={cn(
                           'transition-colors hover:bg-macaron-cream/70',
-                          acc.invalid_401 && 'bg-red-50/80'
+                          acc.result === 'failed' && 'bg-red-50/80'
                         )}
                       >
                         <td className="px-4 py-3 font-medium text-gray-800">{acc.name}</td>
@@ -736,11 +919,14 @@ export default function Home() {
                           )}
                         </td>
                         <td className="px-4 py-3">
-                          {acc.invalid_401 ? (
-                            <span className="flex items-center gap-1 text-rose-600">
-                              <AlertCircle className="w-4 h-4" /> 已失效 (401)
-                            </span>
-                          ) : acc.status_code ? (
+                          {acc.result === 'failed' ? (
+                            <div className="text-rose-600">
+                              <span className="flex items-center gap-1">
+                                <AlertCircle className="w-4 h-4" /> 失败
+                              </span>
+                              {acc.error && <span className="text-xs text-rose-500">{acc.error}</span>}
+                            </div>
+                          ) : acc.result === 'normal' ? (
                             <span className="flex items-center gap-1 text-emerald-600">
                               <CheckCircle2 className="w-4 h-4" /> 正常
                             </span>
