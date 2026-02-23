@@ -42,7 +42,7 @@ interface Account extends ProbeTarget {
 }
 
 const MIN_WORKERS = 1;
-const MAX_WORKERS = 100;
+const MAX_WORKERS = 10;
 const MIN_TIMEOUT_SECONDS = 1;
 const MAX_TIMEOUT_SECONDS = 120;
 const PAGE_SIZE = 100;
@@ -732,6 +732,16 @@ export default function Home() {
             </Button>
           </div>
         </div>
+
+        <section className="bg-white/75 border border-white/60 rounded-2xl shadow-sm p-4 text-xs md:text-sm text-gray-700 space-y-2">
+          <p className="font-semibold text-gray-800">功能与逻辑说明</p>
+          <p>
+            功能：批量检测账号状态，按“全部 / 正常 / 失败”筛选，并支持批量删除失败账号。
+          </p>
+          <p>
+            逻辑：每个账号默认进行 3 轮探测，若 401 次数 ≥ 2 判定为失败，否则判定为正常；检测过程支持停止。
+          </p>
+        </section>
 
         <section className="grid gap-4 bg-white/80 border border-white/60 rounded-2xl shadow-macaron p-6">
           <div className="grid gap-4 md:grid-cols-2">

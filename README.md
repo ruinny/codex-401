@@ -65,7 +65,7 @@ npm run start
 - **Management Token**：管理令牌
 - **Target Type**：默认 `codex`
 - **Provider（可选）**：按 provider 过滤
-- **并发线程**：范围 `1 ~ 100`
+- **并发线程**：范围 `1 ~ 10`
 - **超时(秒)**：范围 `1 ~ 120`
 
 操作流程：
