@@ -1,6 +1,6 @@
 'use client';
 
-import { MutableRefObject, useMemo, useRef, useState } from 'react';
+import { MutableRefObject, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Play,
   Trash2,
@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
+import { useDebouncedValue } from '@/lib/useDebouncedValue';
 import { cn } from '@/lib/utils';
 
 interface Account {
@@ -29,15 +30,86 @@ interface Account {
   deleteStatus?: 'success' | 'failed' | null;
 }
 
+const MIN_WORKERS = 1;
+const MAX_WORKERS = 100;
+const MIN_TIMEOUT_SECONDS = 1;
+const MAX_TIMEOUT_SECONDS = 120;
+const PAGE_SIZE = 100;
+const DELETE_CONCURRENCY = 5;
+const SEARCH_DEBOUNCE_MS = 250;
+const SCAN_FLUSH_INTERVAL_MS = 80;
+const SCAN_FLUSH_BATCH_SIZE = 20;
+
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+};
+
+const clampInteger = (value: number, min: number, max: number): number => {
+  return Math.min(max, Math.max(min, Math.floor(value)));
+};
+
+const parseBoundedInt = (value: string, fallback: number, min: number, max: number): number => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return clampInteger(parsed, min, max);
+};
+
+const normalizeBaseUrl = (raw: string): string => {
+  let parsed: URL;
+
+  try {
+    parsed = new URL(raw.trim());
+  } catch {
+    throw new Error('Base URL 格式无效');
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Base URL 仅支持 http/https');
+  }
+
+  return parsed.origin;
+};
+
+const extractApiErrorMessage = (payload: unknown, fallback: string): string => {
+  if (!isRecord(payload)) {
+    return fallback;
+  }
+
+  if (typeof payload.message === 'string' && payload.message.trim()) {
+    return payload.message;
+  }
+
+  const error = payload.error;
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
+
+  if (isRecord(error) && typeof error.message === 'string' && error.message.trim()) {
+    return error.message;
+  }
+
+  return fallback;
+};
+
 async function limitConcurrency<T>(
   items: T[],
   concurrency: number,
   fn: (item: T, index: number) => Promise<void>,
   shouldStop?: MutableRefObject<boolean>
 ) {
+  if (items.length === 0) {
+    return;
+  }
+
+  const normalizedConcurrency = Number.isFinite(concurrency) ? Math.floor(concurrency) : 1;
+  const workerCount = clampInteger(normalizedConcurrency || 1, 1, items.length);
+
   let nextIndex = 0;
 
-  const workers = Array(Math.min(concurrency, items.length))
+  const workers = Array(workerCount)
     .fill(null)
     .map(async () => {
       while (true) {
@@ -73,13 +145,21 @@ export default function Home() {
   const [scanStopped, setScanStopped] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
 
   const scanAbortController = useRef<AbortController | null>(null);
   const shouldAbortRef = useRef(false);
 
-  const normalizedSearch = search.trim().toLowerCase();
+  const pendingAccountUpdatesRef = useRef(new Map<number, Partial<Account>>());
+  const pendingProgressRef = useRef(0);
+  const scanFlushTimerRef = useRef<number | null>(null);
+
+  const debouncedSearch = useDebouncedValue(search, SEARCH_DEBOUNCE_MS);
+  const normalizedSearch = debouncedSearch.trim().toLowerCase();
+
   const filteredAccounts = useMemo(() => {
     if (!normalizedSearch) return accounts;
+
     return accounts.filter(acc => {
       const name = (acc.name || '').toLowerCase();
       const accountValue = (acc.account || '').toLowerCase();
@@ -87,6 +167,22 @@ export default function Home() {
       return [name, accountValue, email].some(field => field.includes(normalizedSearch));
     });
   }, [accounts, normalizedSearch]);
+
+  const totalPages = useMemo(() => {
+    return Math.max(1, Math.ceil(filteredAccounts.length / PAGE_SIZE));
+  }, [filteredAccounts.length]);
+
+  useEffect(() => {
+    setPage(prev => Math.min(prev, totalPages));
+  }, [totalPages]);
+
+  const pagedAccounts = useMemo(() => {
+    const start = (page - 1) * PAGE_SIZE;
+    return filteredAccounts.slice(start, start + PAGE_SIZE);
+  }, [filteredAccounts, page]);
+
+  const pageStart = filteredAccounts.length === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
+  const pageEnd = Math.min(page * PAGE_SIZE, filteredAccounts.length);
 
   const invalidCount = useMemo(() => accounts.filter(a => a.invalid_401).length, [accounts]);
   const isDeletingAny = useMemo(() => accounts.some(acc => acc.isDeleting), [accounts]);
@@ -100,10 +196,90 @@ export default function Home() {
     return `${progress.current} / ${progress.total}`;
   }, [isStopping, scanStopped, isChecking, progress]);
 
-  const updateAccount = (index: number, changes: Partial<Account>) => {
+  const flushPendingScanState = () => {
+    const pendingEntries = Array.from(pendingAccountUpdatesRef.current.entries());
+    const pendingProgress = pendingProgressRef.current;
+
+    if (pendingEntries.length > 0) {
+      pendingAccountUpdatesRef.current.clear();
+      setAccounts(prev => {
+        if (prev.length === 0) return prev;
+
+        const next = [...prev];
+        for (const [index, changes] of pendingEntries) {
+          const current = next[index];
+          if (!current) continue;
+          next[index] = { ...current, ...changes };
+        }
+
+        return next;
+      });
+    }
+
+    if (pendingProgress > 0) {
+      pendingProgressRef.current = 0;
+      setProgress(prev => ({
+        ...prev,
+        current: Math.min(prev.total, prev.current + pendingProgress),
+      }));
+    }
+  };
+
+  const clearScanFlushTimer = () => {
+    if (scanFlushTimerRef.current !== null) {
+      window.clearTimeout(scanFlushTimerRef.current);
+      scanFlushTimerRef.current = null;
+    }
+  };
+
+  const scheduleScanFlush = () => {
+    if (
+      pendingAccountUpdatesRef.current.size >= SCAN_FLUSH_BATCH_SIZE
+      || pendingProgressRef.current >= SCAN_FLUSH_BATCH_SIZE
+    ) {
+      clearScanFlushTimer();
+      flushPendingScanState();
+      return;
+    }
+
+    if (scanFlushTimerRef.current !== null) {
+      return;
+    }
+
+    scanFlushTimerRef.current = window.setTimeout(() => {
+      scanFlushTimerRef.current = null;
+      flushPendingScanState();
+    }, SCAN_FLUSH_INTERVAL_MS);
+  };
+
+  const queueScanAccountUpdate = (index: number, changes: Partial<Account>) => {
+    const existing = pendingAccountUpdatesRef.current.get(index);
+    pendingAccountUpdatesRef.current.set(index, existing ? { ...existing, ...changes } : changes);
+    scheduleScanFlush();
+  };
+
+  const queueProgressTick = () => {
+    pendingProgressRef.current += 1;
+    scheduleScanFlush();
+  };
+
+  const resetScanBuffers = () => {
+    pendingAccountUpdatesRef.current.clear();
+    pendingProgressRef.current = 0;
+    clearScanFlushTimer();
+  };
+
+  useEffect(() => {
+    return () => {
+      clearScanFlushTimer();
+    };
+  }, []);
+
+  const updateAccountImmediate = (index: number, changes: Partial<Account>) => {
     setAccounts(prev => {
       const target = prev[index];
       if (!target) return prev;
+
       const next = [...prev];
       next[index] = { ...target, ...changes };
       return next;
@@ -111,9 +287,31 @@ export default function Home() {
   };
 
   const startCheck = async () => {
+    if (isChecking) return;
+
     if (!baseUrl || !token) {
       alert('请填入 Base URL 和 Token');
       return;
+    }
+
+    let normalizedBaseUrl = '';
+    try {
+      normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Base URL 格式无效';
+      alert(message);
+      return;
+    }
+
+    const safeWorkers = clampInteger(workers, MIN_WORKERS, MAX_WORKERS);
+    const safeTimeout = clampInteger(timeout, MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
+
+    if (safeWorkers !== workers) {
+      setWorkers(safeWorkers);
+    }
+
+    if (safeTimeout !== timeout) {
+      setTimeoutSec(safeTimeout);
     }
 
     shouldAbortRef.current = false;
@@ -121,9 +319,10 @@ export default function Home() {
     setIsStopping(false);
     setIsChecking(true);
     setAccounts([]);
+    setPage(1);
     setProgress({ current: 0, total: 0 });
+    resetScanBuffers();
 
-    const normalizedBaseUrl = baseUrl.replace(/\/+/g, '/').replace(/\/+$/, '');
     const controller = new AbortController();
     scanAbortController.current = controller;
 
@@ -131,29 +330,46 @@ export default function Home() {
       const res = await fetch('/api/accounts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ baseUrl: normalizedBaseUrl, token, timeout }),
+        body: JSON.stringify({ baseUrl: normalizedBaseUrl, token, timeout: safeTimeout }),
         signal: controller.signal,
       });
-      const data = await res.json();
+      const data: unknown = await res.json().catch(() => ({}));
 
       if (!res.ok) {
-        throw new Error(data.error || '获取账号列表失败');
+        throw new Error(extractApiErrorMessage(data, '获取账号列表失败'));
       }
 
-      const allFiles = data.files || [];
-      const candidates = allFiles.filter((f: any) => {
-        const type = (f.type || f.typo || '').toLowerCase();
-        if (type !== targetType.toLowerCase()) return false;
-        if (provider && (f.provider || '').toLowerCase() !== provider.toLowerCase()) return false;
+      const allFiles = isRecord(data) && Array.isArray(data.files) ? data.files : [];
+      const targetTypeValue = targetType.trim().toLowerCase();
+      const providerValue = provider.trim().toLowerCase();
+
+      const candidates = allFiles.filter((file): file is Record<string, unknown> => {
+        if (!isRecord(file)) return false;
+
+        const type = String(file.type ?? file.typo ?? '').toLowerCase();
+        if (type !== targetTypeValue) return false;
+
+        if (providerValue) {
+          const fileProvider = String(file.provider ?? '').toLowerCase();
+          if (fileProvider !== providerValue) return false;
+        }
+
         return true;
       });
 
-      setAccounts(candidates.map((c: any) => ({
-        ...c,
-        account: c.account || c.email || '',
+      setAccounts(candidates.map(file => ({
+        name: String(file.name ?? ''),
+        account: String(file.account ?? file.email ?? ''),
+        email: file.email == null ? undefined : String(file.email),
+        auth_index: file.auth_index == null ? undefined : String(file.auth_index),
+        type: file.type == null ? undefined : String(file.type),
+        typo: file.typo == null ? undefined : String(file.typo),
+        provider: file.provider == null ? undefined : String(file.provider),
         status_code: null,
         invalid_401: false,
         error: null,
+        isDeleting: false,
+        deleteStatus: null,
       })));
 
       setProgress({ current: 0, total: candidates.length });
@@ -162,17 +378,19 @@ export default function Home() {
         return;
       }
 
-      await limitConcurrency(candidates, workers, async (item, index) => {
+      await limitConcurrency(candidates, safeWorkers, async (item, index) => {
         try {
           const innerController = scanAbortController.current;
           if (!innerController) return;
 
-          const chatgpt_account_id =
-            item.chatgpt_account_id ||
-            item.chatgptAccountId ||
-            item.account_id ||
-            item.accountId ||
-            chatgptAccountId;
+          const chatgptAccountSource =
+            item.chatgpt_account_id
+            ?? item.chatgptAccountId
+            ?? item.account_id
+            ?? item.accountId
+            ?? chatgptAccountId;
+
+          const chatgpt_account_id = chatgptAccountSource == null ? '' : String(chatgptAccountSource);
 
           const payload = {
             authIndex: item.auth_index,
@@ -196,17 +414,25 @@ export default function Home() {
               const probeRes = await fetch('/api/probe', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ baseUrl: normalizedBaseUrl, token, payload, timeout }),
+                body: JSON.stringify({
+                  baseUrl: normalizedBaseUrl,
+                  token,
+                  payload,
+                  timeout: safeTimeout,
+                }),
                 signal: innerController.signal,
               });
 
-              const probeData = await probeRes.json();
+              const probeData: unknown = await probeRes.json().catch(() => ({}));
               if (!probeRes.ok) {
-                throw new Error(probeData?.error || `探测返回 ${probeRes.status}`);
+                throw new Error(extractApiErrorMessage(probeData, `探测返回 ${probeRes.status}`));
               }
 
-              const statusCode = probeData.status_code;
-              updateAccount(index, {
+              const statusCode = isRecord(probeData) && typeof probeData.status_code === 'number'
+                ? probeData.status_code
+                : null;
+
+              queueScanAccountUpdate(index, {
                 status_code: statusCode,
                 invalid_401: statusCode === 401,
                 error: statusCode === null ? 'Missing status_code' : null,
@@ -225,14 +451,14 @@ export default function Home() {
             }
           }
         } catch (err: unknown) {
-          const error = err as Error;
           if (scanAbortController.current?.signal.aborted) {
             return;
           }
 
-          updateAccount(index, { error: error.message });
+          const message = err instanceof Error ? err.message : '探测失败';
+          queueScanAccountUpdate(index, { error: message });
         } finally {
-          setProgress(prev => ({ ...prev, current: prev.current + 1 }));
+          queueProgressTick();
         }
       }, shouldAbortRef);
     } catch (err: unknown) {
@@ -241,16 +467,21 @@ export default function Home() {
         alert(error.message);
       }
     } finally {
+      clearScanFlushTimer();
+      flushPendingScanState();
+
       const wasStopped = shouldAbortRef.current;
       setIsStopping(false);
       setIsChecking(false);
       setScanStopped(wasStopped);
       scanAbortController.current = null;
+      shouldAbortRef.current = false;
     }
   };
 
   const stopScan = () => {
     if (!isChecking || isStopping) return;
+
     shouldAbortRef.current = true;
     setIsStopping(true);
     setScanStopped(true);
@@ -263,27 +494,43 @@ export default function Home() {
 
     if (!confirm(`确定要删除这 ${invalidAccounts.length} 个失效账号吗？`)) return;
 
-    const normalizedBaseUrl = baseUrl.replace(/\/+/g, '/').replace(/\/+$/, '');
+    let normalizedBaseUrl = '';
+    try {
+      normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Base URL 格式无效';
+      alert(message);
+      return;
+    }
 
-    await limitConcurrency(accounts, 5, async (acc, index) => {
+    const safeTimeout = clampInteger(timeout, MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
+    if (safeTimeout !== timeout) {
+      setTimeoutSec(safeTimeout);
+    }
+
+    await limitConcurrency(accounts, DELETE_CONCURRENCY, async (acc, index) => {
       if (!acc.invalid_401) return;
 
-      updateAccount(index, { isDeleting: true });
+      updateAccountImmediate(index, { isDeleting: true });
 
       try {
         const res = await fetch('/api/delete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ baseUrl: normalizedBaseUrl, token, name: acc.name, timeout }),
+          body: JSON.stringify({
+            baseUrl: normalizedBaseUrl,
+            token,
+            name: acc.name,
+            timeout: safeTimeout,
+          }),
         });
 
-        const ok = res.status === 200;
-        updateAccount(index, {
+        updateAccountImmediate(index, {
           isDeleting: false,
-          deleteStatus: ok ? 'success' : 'failed',
+          deleteStatus: res.ok ? 'success' : 'failed',
         });
       } catch (error) {
-        updateAccount(index, {
+        updateAccountImmediate(index, {
           isDeleting: false,
           deleteStatus: 'failed',
         });
@@ -366,8 +613,9 @@ export default function Home() {
               <input
                 type="number"
                 value={workers}
-                min={1}
-                onChange={e => setWorkers(parseInt(e.target.value) || 1)}
+                min={MIN_WORKERS}
+                max={MAX_WORKERS}
+                onChange={e => setWorkers(parseBoundedInt(e.target.value, MIN_WORKERS, MIN_WORKERS, MAX_WORKERS))}
                 className="w-full mt-1 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-macaron-mint"
               />
             </label>
@@ -376,8 +624,9 @@ export default function Home() {
               <input
                 type="number"
                 value={timeout}
-                min={1}
-                onChange={e => setTimeoutSec(parseInt(e.target.value) || 1)}
+                min={MIN_TIMEOUT_SECONDS}
+                max={MAX_TIMEOUT_SECONDS}
+                onChange={e => setTimeoutSec(parseBoundedInt(e.target.value, MIN_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS))}
                 className="w-full mt-1 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-macaron-apricot"
               />
             </label>
@@ -410,6 +659,35 @@ export default function Home() {
         </div>
 
         <section className="bg-white/90 border border-white/60 rounded-2xl shadow-macaron overflow-hidden">
+          <div className="px-4 py-3 border-b border-zinc-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <span className="text-xs text-gray-600">
+              {filteredAccounts.length === 0
+                ? '当前无匹配结果'
+                : `显示 ${pageStart}-${pageEnd} / ${filteredAccounts.length} 条`}
+            </span>
+            {totalPages > 1 && (
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={page === 1}
+                  onClick={() => setPage(prev => Math.max(1, prev - 1))}
+                >
+                  上一页
+                </Button>
+                <span className="text-xs text-gray-600">{page} / {totalPages}</span>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={page >= totalPages}
+                  onClick={() => setPage(prev => Math.min(totalPages, prev + 1))}
+                >
+                  下一页
+                </Button>
+              </div>
+            )}
+          </div>
+
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="bg-white/70 text-gray-600">
@@ -422,63 +700,68 @@ export default function Home() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-100">
-                {filteredAccounts.length === 0 ? (
+                {pagedAccounts.length === 0 ? (
                   <tr>
                     <td colSpan={5} className="px-4 py-8 text-center text-zinc-500">
                       暂无数据，请填入配置并开始检测
                     </td>
                   </tr>
                 ) : (
-                  filteredAccounts.map((acc, index) => (
-                    <tr
-                      key={`${acc.name}-${index}`}
-                      className={cn(
-                        'transition-colors hover:bg-macaron-cream/70',
-                        acc.invalid_401 && 'bg-red-50/80'
-                      )}
-                    >
-                      <td className="px-4 py-3 font-medium text-gray-800">{acc.name}</td>
-                      <td className="px-4 py-3 text-gray-600">{acc.account}</td>
-                      <td className="px-4 py-3 text-center">
-                        {acc.status_code != null && (
-                          <span
-                            className={cn(
-                              'px-2 py-1 rounded-full text-xs font-semibold',
-                              acc.status_code === 401
-                                ? 'bg-rose-100 text-rose-700'
-                                : 'bg-emerald-100 text-emerald-700'
-                            )}
-                          >
-                            {acc.status_code}
-                          </span>
+                  pagedAccounts.map((acc, index) => {
+                    const absoluteIndex = (page - 1) * PAGE_SIZE + index;
+                    const rowKey = `${acc.name}-${acc.auth_index ?? acc.account ?? acc.email ?? absoluteIndex}`;
+
+                    return (
+                      <tr
+                        key={rowKey}
+                        className={cn(
+                          'transition-colors hover:bg-macaron-cream/70',
+                          acc.invalid_401 && 'bg-red-50/80'
                         )}
-                      </td>
-                      <td className="px-4 py-3">
-                        {acc.invalid_401 ? (
-                          <span className="flex items-center gap-1 text-rose-600">
-                            <AlertCircle className="w-4 h-4" /> 已失效 (401)
-                          </span>
-                        ) : acc.status_code ? (
-                          <span className="flex items-center gap-1 text-emerald-600">
-                            <CheckCircle2 className="w-4 h-4" /> 正常
-                          </span>
-                        ) : acc.error ? (
-                          <span className="text-rose-500 line-clamp-2" title={acc.error}>{acc.error}</span>
-                        ) : (
-                          <span className="text-zinc-400">等待检测...</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        {acc.deleteStatus === 'success' ? (
-                          <span className="text-zinc-400 text-xs italic">已移除</span>
-                        ) : acc.isDeleting ? (
-                          <Loader2 className="w-4 h-4 animate-spin inline" />
-                        ) : acc.deleteStatus === 'failed' ? (
-                          <span className="text-red-500 text-xs">删除失败</span>
-                        ) : null}
-                      </td>
-                    </tr>
-                  ))
+                      >
+                        <td className="px-4 py-3 font-medium text-gray-800">{acc.name}</td>
+                        <td className="px-4 py-3 text-gray-600">{acc.account}</td>
+                        <td className="px-4 py-3 text-center">
+                          {acc.status_code != null && (
+                            <span
+                              className={cn(
+                                'px-2 py-1 rounded-full text-xs font-semibold',
+                                acc.status_code === 401
+                                  ? 'bg-rose-100 text-rose-700'
+                                  : 'bg-emerald-100 text-emerald-700'
+                              )}
+                            >
+                              {acc.status_code}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {acc.invalid_401 ? (
+                            <span className="flex items-center gap-1 text-rose-600">
+                              <AlertCircle className="w-4 h-4" /> 已失效 (401)
+                            </span>
+                          ) : acc.status_code ? (
+                            <span className="flex items-center gap-1 text-emerald-600">
+                              <CheckCircle2 className="w-4 h-4" /> 正常
+                            </span>
+                          ) : acc.error ? (
+                            <span className="text-rose-500 line-clamp-2" title={acc.error}>{acc.error}</span>
+                          ) : (
+                            <span className="text-zinc-400">等待检测...</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          {acc.deleteStatus === 'success' ? (
+                            <span className="text-zinc-400 text-xs italic">已移除</span>
+                          ) : acc.isDeleting ? (
+                            <Loader2 className="w-4 h-4 animate-spin inline" />
+                          ) : acc.deleteStatus === 'failed' ? (
+                            <span className="text-red-500 text-xs">删除失败</span>
+                          ) : null}
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>

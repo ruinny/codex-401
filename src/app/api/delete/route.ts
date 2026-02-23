@@ -1,28 +1,49 @@
 import { NextResponse } from 'next/server';
 import axios from 'axios';
 
+import {
+  ApiRequestError,
+  toApiError,
+} from '@/lib/server/api-error';
+
+import {
+  isRecord,
+  parseBaseUrl,
+  parseRequiredString,
+  parseTimeoutSeconds,
+} from '@/lib/server/request-validation';
+
 export async function POST(request: Request) {
   try {
-    const { baseUrl, token, name, timeout } = await request.json();
+    const body: unknown = await request.json();
+    if (!isRecord(body)) {
+      throw new ApiRequestError('请求体必须是 JSON 对象', 400, 'INVALID_INPUT');
+    }
+
+    const baseUrl = parseBaseUrl(body.baseUrl);
+    const token = parseRequiredString(body.token, 'token');
+    const name = parseRequiredString(body.name, 'name');
+    const timeout = parseTimeoutSeconds(body.timeout);
 
     const encodedName = encodeURIComponent(name);
     const response = await axios.delete(
       `${baseUrl}/v0/management/auth-files?name=${encodedName}`,
       {
         headers: {
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'application/json',
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
         },
-        timeout: (timeout || 12) * 1000,
+        timeout: timeout * 1000,
       }
     );
 
     return NextResponse.json(response.data);
-  } catch (error: any) {
-    console.error('Delete error:', error.message);
+  } catch (error: unknown) {
+    const apiError = toApiError(error);
+    console.error('Delete error:', apiError.message);
     return NextResponse.json(
-      { error: error.response?.data || error.message },
-      { status: error.response?.status || 500 }
+      { error: apiError },
+      { status: apiError.status }
     );
   }
 }
