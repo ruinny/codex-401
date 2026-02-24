@@ -9,14 +9,15 @@ import {
   Loader2,
   Search,
   Pause,
+  RefreshCw,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { useDebouncedValue } from '@/lib/useDebouncedValue';
 import { cn } from '@/lib/utils';
 
-type ResultState = 'unknown' | 'normal' | 'failed';
-type ResultFilter = 'all' | 'normal' | 'failed' | 'unknown';
+type ResultState = 'unchecked' | 'unknown' | 'normal' | 'failed';
+type ResultFilter = 'all' | 'normal' | 'failed' | 'unknown' | 'unchecked';
 
 interface ProbeTarget {
   auth_index?: string;
@@ -37,8 +38,14 @@ interface Account extends ProbeTarget {
   invalid_401?: boolean;
   result?: ResultState;
   error?: string | null;
+  errorReason?: string | null;
   isDeleting?: boolean;
   deleteStatus?: 'success' | 'failed' | null;
+}
+
+interface RecheckItem {
+  target: Account;
+  index: number;
 }
 
 const MIN_WORKERS = 1;
@@ -53,7 +60,9 @@ const SCAN_FLUSH_BATCH_SIZE = 20;
 const PROBE_RETRY_LIMIT = 1;
 const SCAN_RECHECK_ROUNDS = 3;
 const SCAN_RECHECK_DELAY_MS = 200;
-
+const RECHECK_CONCURRENCY = 3;
+const RECHECK_ROUNDS = 3;
+const RECHECK_DELAY_MS = 200;
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 };
@@ -108,6 +117,44 @@ const extractApiErrorMessage = (payload: unknown, fallback: string): string => {
   }
 
   return fallback;
+};
+
+const describeProbeErrorReason = (message: string | null | undefined, fallback = '证据不足'): string => {
+  if (!message) {
+    return fallback;
+  }
+
+  const normalized = message.toLowerCase();
+
+  if (normalized.includes('status_code') || normalized.includes('status code')) {
+    return '未返回状态码';
+  }
+
+  if (normalized.includes('timeout') || normalized.includes('timed out')) {
+    return '探测超时';
+  }
+
+  if (normalized.includes('abort') || normalized.includes('cancel')) {
+    return '请求已中止';
+  }
+
+  if (normalized.includes('network') || normalized.includes('fetch failed')) {
+    return '网络异常';
+  }
+
+  if (normalized.includes('gateway') || normalized.includes('502') || normalized.includes('504')) {
+    return '上游网关错误';
+  }
+
+  if (normalized.includes('401')) {
+    return '401 未授权';
+  }
+
+  if (normalized.includes('403')) {
+    return '403 拒绝访问';
+  }
+
+  return message;
 };
 
 const getOptionalString = (value: unknown): string | undefined => {
@@ -190,16 +237,27 @@ export default function Home() {
   const [chatgptAccountId, setChatgptAccountId] = useState('');
 
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const accountsRef = useRef<Account[]>(accounts);
+  useEffect(() => {
+    accountsRef.current = accounts;
+  }, [accounts]);
   const [isChecking, setIsChecking] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [scanStopped, setScanStopped] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [search, setSearch] = useState('');
+  const [isRechecking, setIsRechecking] = useState(false);
+  const [recheckProgress, setRecheckProgress] = useState({ current: 0, total: 0 });
   const [resultFilter, setResultFilter] = useState<ResultFilter>('all');
   const [page, setPage] = useState(1);
 
   const scanAbortController = useRef<AbortController | null>(null);
   const shouldAbortRef = useRef(false);
+  const normalizedBaseUrlRef = useRef('');
+  const recheckAbortController = useRef<AbortController | null>(null);
+  const recheckShouldAbortRef = useRef(false);
+  const deleteAbortController = useRef<AbortController | null>(null);
+  const deleteShouldAbortRef = useRef(false);
 
   const pendingAccountUpdatesRef = useRef(new Map<number, Partial<Account>>());
   const pendingProgressRef = useRef(0);
@@ -219,6 +277,10 @@ export default function Home() {
       }
 
       if (resultFilter === 'unknown' && acc.result !== 'unknown') {
+        return false;
+      }
+
+      if (resultFilter === 'unchecked' && acc.result !== 'unchecked') {
         return false;
       }
 
@@ -254,6 +316,7 @@ export default function Home() {
   const failedCount = useMemo(() => accounts.filter(a => a.result === 'failed').length, [accounts]);
   const normalCount = useMemo(() => accounts.filter(a => a.result === 'normal').length, [accounts]);
   const unknownCount = useMemo(() => accounts.filter(a => a.result === 'unknown').length, [accounts]);
+  const uncheckedCount = useMemo(() => accounts.filter(a => a.result === 'unchecked').length, [accounts]);
   const isDeletingAny = useMemo(() => accounts.some(acc => acc.isDeleting), [accounts]);
 
   const progressPercentage = progress.total > 0 ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : 0;
@@ -281,6 +344,7 @@ export default function Home() {
           next[index] = { ...current, ...changes };
         }
 
+        accountsRef.current = next;
         return next;
       });
     }
@@ -332,10 +396,134 @@ export default function Home() {
     scheduleScanFlush();
   };
 
+  const queueRecheckProgressTick = () => {
+    setRecheckProgress(prev => {
+      if (prev.total === 0) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        current: Math.min(prev.total, prev.current + 1),
+      };
+    });
+  };
+
+  const runRecheck = async (normalizedBaseUrl: string, requestToken: string, safeTimeout: number) => {
+    if (shouldAbortRef.current) {
+      return;
+    }
+
+    const pendingItems: RecheckItem[] = accountsRef.current
+      .map((item, index) => ({ target: item, index }))
+      .filter(({ target }) => target.result === 'unknown' || target.result === 'unchecked');
+
+    if (pendingItems.length === 0) {
+      return;
+    }
+
+    recheckShouldAbortRef.current = false;
+    const controller = new AbortController();
+    recheckAbortController.current = controller;
+    setIsRechecking(true);
+    setRecheckProgress({ current: 0, total: pendingItems.length });
+
+    try {
+      await limitConcurrency(pendingItems, RECHECK_CONCURRENCY, async (item) => {
+        try {
+          if (controller.signal.aborted || shouldAbortRef.current) {
+            return;
+          }
+
+          const statuses: number[] = [];
+          let probeError: string | null = null;
+
+          for (let round = 0; round < RECHECK_ROUNDS; round += 1) {
+            if (controller.signal.aborted || shouldAbortRef.current) {
+              return;
+            }
+
+            try {
+              const status = await probeAccountStatus({
+                normalizedBaseUrl,
+                token: requestToken,
+                timeoutSeconds: safeTimeout,
+                target: item.target,
+                signal: controller.signal,
+              });
+
+              if (typeof status === 'number') {
+                statuses.push(status);
+              } else {
+                probeError = '探测缺少 status_code';
+              }
+            } catch (err: unknown) {
+              probeError = err instanceof Error ? err.message : '探测失败';
+            }
+
+            if (round < RECHECK_ROUNDS - 1) {
+              await sleep(RECHECK_DELAY_MS, controller.signal);
+            }
+          }
+
+          const finalResult = classifyFromStatuses(statuses);
+          const reason = describeProbeErrorReason(probeError);
+          queueScanAccountUpdate(item.index, {
+            status_code: finalResult.status_code,
+            invalid_401: finalResult.invalid_401,
+            result: finalResult.result,
+            error: finalResult.result === 'unknown' ? (probeError || '复检结果不足，暂不判定失败') : null,
+            errorReason: finalResult.result === 'unknown' ? reason : null,
+          });
+        } catch (err: unknown) {
+          if (controller.signal.aborted || shouldAbortRef.current) {
+            return;
+          }
+
+          const message = err instanceof Error ? err.message : '探测失败';
+          queueScanAccountUpdate(item.index, {
+            result: 'unknown',
+            invalid_401: false,
+            error: message,
+            errorReason: describeProbeErrorReason(message),
+          });
+        } finally {
+          if (!controller.signal.aborted && !shouldAbortRef.current) {
+            queueRecheckProgressTick();
+          }
+        }
+      }, recheckShouldAbortRef);
+    } finally {
+      const recheckAborted = controller.signal.aborted || recheckShouldAbortRef.current || shouldAbortRef.current;
+      recheckAbortController.current = null;
+      recheckShouldAbortRef.current = false;
+      setIsRechecking(false);
+      setRecheckProgress(prev => ({
+        current: recheckAborted ? Math.min(prev.current, prev.total) : prev.total,
+        total: prev.total,
+      }));
+    }
+  };
+
   const resetScanBuffers = () => {
     pendingAccountUpdatesRef.current.clear();
     pendingProgressRef.current = 0;
     clearScanFlushTimer();
+  };
+
+  const resolveNormalizedBaseUrl = (): string => {
+    const trimmed = baseUrl.trim();
+    if (trimmed) {
+      const normalized = normalizeBaseUrl(trimmed);
+      normalizedBaseUrlRef.current = normalized;
+      return normalized;
+    }
+
+    if (normalizedBaseUrlRef.current) {
+      return normalizedBaseUrlRef.current;
+    }
+
+    throw new Error('Base URL 不能为空');
   };
 
   useEffect(() => {
@@ -480,9 +668,14 @@ export default function Home() {
       return;
     }
 
+    recheckShouldAbortRef.current = true;
+    recheckAbortController.current?.abort();
+    setIsRechecking(false);
+    setRecheckProgress({ current: 0, total: 0 });
+
     let normalizedBaseUrl = '';
     try {
-      normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+      normalizedBaseUrl = resolveNormalizedBaseUrl();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Base URL 格式无效';
       alert(message);
@@ -512,6 +705,7 @@ export default function Home() {
 
     const controller = new AbortController();
     scanAbortController.current = controller;
+    normalizedBaseUrlRef.current = normalizedBaseUrl;
 
     try {
       const res = await fetch('/api/accounts', {
@@ -558,8 +752,9 @@ export default function Home() {
           accountId: getOptionalString(file.accountId),
           status_code: null,
           invalid_401: false,
-          result: 'unknown',
+          result: 'unchecked',
           error: null,
+          errorReason: null,
           isDeleting: false,
           deleteStatus: null,
         }));
@@ -608,11 +803,13 @@ export default function Home() {
           }
 
           const finalResult = classifyFromStatuses(statuses);
+          const reason = describeProbeErrorReason(probeError);
           queueScanAccountUpdate(index, {
             status_code: finalResult.status_code,
             invalid_401: finalResult.invalid_401,
             result: finalResult.result,
             error: finalResult.result === 'unknown' ? (probeError || '复检结果不足，暂不判定失败') : null,
+            errorReason: finalResult.result === 'unknown' ? reason : null,
           });
         } catch (err: unknown) {
           if (scanAbortController.current?.signal.aborted) {
@@ -624,11 +821,13 @@ export default function Home() {
             result: 'unknown',
             invalid_401: false,
             error: message,
+            errorReason: describeProbeErrorReason(message),
           });
         } finally {
           queueProgressTick();
         }
       }, shouldAbortRef);
+      await runRecheck(normalizedBaseUrl, token, safeTimeout);
     } catch (err: unknown) {
       const error = err as Error;
       if (!scanAbortController.current?.signal.aborted) {
@@ -664,7 +863,7 @@ export default function Home() {
 
     let normalizedBaseUrl = '';
     try {
-      normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+      normalizedBaseUrl = resolveNormalizedBaseUrl();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Base URL 格式无效';
       alert(message);
@@ -843,6 +1042,7 @@ export default function Home() {
               <option value="normal">正常</option>
               <option value="failed">失败</option>
               <option value="unknown">未知</option>
+              <option value="unchecked">未扫描</option>
             </select>
           </label>
         </div>
