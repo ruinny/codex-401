@@ -182,8 +182,8 @@ async function limitConcurrency<T>(
 export default function Home() {
   const [baseUrl, setBaseUrl] = useState('');
   const [token, setToken] = useState('');
-  const [targetType, setTargetType] = useState('codex');
-  const [provider, setProvider] = useState('');
+  const targetType = 'codex';
+  const provider = '';
   const [workers, setWorkers] = useState(20);
   const [timeout, setTimeoutSec] = useState(12);
   const [userAgent, setUserAgent] = useState('codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal');
@@ -769,23 +769,13 @@ export default function Home() {
               />
             </label>
           </div>
-          <div className="grid gap-4 md:grid-cols-4">
-            <label className="text-sm font-medium text-gray-600">
+          <div className="grid gap-4 md:grid-cols-3">
+            <div className="text-sm font-medium text-gray-600">
               Target Type
-              <input
-                value={targetType}
-                onChange={e => setTargetType(e.target.value)}
-                className="w-full mt-1 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-macaron-apricot"
-              />
-            </label>
-            <label className="text-sm font-medium text-gray-600">
-              Provider (可选)
-              <input
-                value={provider}
-                onChange={e => setProvider(e.target.value)}
-                className="w-full mt-1 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-macaron-lavender"
-              />
-            </label>
+              <div className="w-full mt-1 rounded-2xl border border-zinc-200 bg-zinc-100 px-3 py-2 text-sm text-gray-700">
+                codex
+              </div>
+            </div>
             <label className="text-sm font-medium text-gray-600">
               并发线程
               <input
